@@ -36,7 +36,7 @@ PRODUCT_ID_BY_SYMBOL = {
 SPREAD_PERCENT = 0.05  # Spread in percent (0.05% = 5 bps)
 MIN_SPREAD_BPS = 5.0  # Min spread in bps for placing orders
 REQUOTE_BPS = 3.0     # Requote orders if price moves > this bps
-ORDER_SIZE_USD = 110.0  # Order size
+ORDER_SIZE_USD = 100.0  # Order size
 MAX_POSITION_SIZE_USD = 100.0  # Max position size
 
 # Risk management
@@ -65,8 +65,6 @@ POST_ONLY_MAX_RETRIES = 0  # 0 = skip cycle on 2008 instead of aggressive repost
 REDUCE_IOC_COOLDOWN_SECONDS = 60  # Throttle reduce-only IOC attempts on repeated 2006
 TP_PNL_PERCENT = 0.25  # Close position when unrealized PnL >= this percent
 TP_COOLDOWN_SECONDS = 30  # Cooldown between TP close attempts
-HEALTH_REDUCE_PNL_PERCENT = 0.25  # On 2006, reduce position only if pnl% >= threshold
-HEALTH_REDUCE_FRACTION = 0.5  # On 2006, cut position by half
 PRICE_INCREMENT_X18_BY_SYMBOL = {
     "BTC": 1_000_000_000_000_000_000,
     "ETH": 0,  # auto-loaded from market metadata at runtime
@@ -649,7 +647,6 @@ class MarketMakerBot:
             self.log.warning("health: canceled %s open orders | product=%s", len(order_ids), product_id)
 
         # 2) Reduce existing position with a reduce-only IOC order.
-        # For 2006 we reduce by fraction only when current pnl% is good enough.
         now = time.time()
         last_reduce = self._last_reduce_ioc_ts.get(product_id, 0.0)
         if now - last_reduce < REDUCE_IOC_COOLDOWN_SECONDS:
@@ -659,34 +656,17 @@ class MarketMakerBot:
                 REDUCE_IOC_COOLDOWN_SECONDS - (now - last_reduce),
             )
             return
-        snap = await self._query_with_retries(self.api.get_position_snapshot, product_id)
-        amount = snap.get("amount", 0.0)
-        mark = snap.get("mark_price", 0.0)
-        v_quote = snap.get("v_quote", 0.0)
-        if abs(amount) <= 0 or mark <= 0:
+        pos_usd = await self._query_with_retries(self.api.get_position_usd, product_id)
+        if abs(pos_usd) <= 0:
             return
-        position_notional = abs(amount * mark)
-        if position_notional <= 0:
-            return
-        unrealized_pnl = amount * mark + v_quote
-        pnl_pct = unrealized_pnl / position_notional * 100.0
-        if pnl_pct < HEALTH_REDUCE_PNL_PERCENT:
-            self.log.warning(
-                "health: skip reduce IOC (pnl below threshold) | product=%s pnl_pct=%.4f threshold=%.4f",
-                product_id,
-                pnl_pct,
-                HEALTH_REDUCE_PNL_PERCENT,
-            )
-            return
-
-        reduce_size = self._snap_size(product_id, abs(amount) * HEALTH_REDUCE_FRACTION)
+        reduce_size = self._snap_size(product_id, abs(pos_usd) / mid_price)
         if reduce_size <= 0:
             self.log.warning("health: cannot reduce, snapped size is zero | product=%s", product_id)
             return
-        reduce_is_buy = amount < 0  # buy to reduce short, sell to reduce long
+        reduce_is_buy = pos_usd < 0  # buy to reduce short, sell to reduce long
         aggressive_price = self._snap_price(
             product_id,
-            mark * (1.02 if reduce_is_buy else 0.98),
+            mid_price * (1.02 if reduce_is_buy else 0.98),
             reduce_is_buy,
         )
         try:
@@ -701,12 +681,11 @@ class MarketMakerBot:
             )
             self._last_reduce_ioc_ts[product_id] = now
             self.log.warning(
-                "health: sent reduce-only IOC | product=%s side=%s size=%.6f price=%.4f pnl_pct=%.4f",
+                "health: sent reduce-only IOC | product=%s side=%s size=%.6f price=%.4f",
                 product_id,
                 "BUY" if reduce_is_buy else "SELL",
                 reduce_size,
                 aggressive_price,
-                pnl_pct,
             )
         except Exception as exc:
             self.log.error("health: failed to reduce position | product=%s err=%s", product_id, exc)
@@ -828,7 +807,7 @@ class MarketMakerBot:
             except Exception as exc:
                 # Business-rule errors are not transient; do not retry them.
                 code = self._extract_error_code(exc)
-                if code in {2000, 2001, 2006, 2008, 2070, 2094, 2011}:
+                if code in {2000, 2001, 2006, 2008, 2094, 2011}:
                     raise
                 if attempt >= self.cfg.query_retries:
                     raise
@@ -902,9 +881,6 @@ class MarketMakerBot:
                     if code == 2006:
                         self.log.warning("health: insufficient account health; attempting risk-off actions | product=%s", product_id)
                         await self._handle_insufficient_health(product_id, mid_price)
-                        return
-                    if code == 2070:
-                        self.log.warning("Market has reached maximum open interest.")
                         return
                     if code == 2008 and attempt < POST_ONLY_MAX_RETRIES:
                         active = await self._query_with_retries(self.api.list_open_orders, product_id)
