@@ -1,0 +1,4 @@
+playwright
+gspread
+google-auth
+python-dotenv
